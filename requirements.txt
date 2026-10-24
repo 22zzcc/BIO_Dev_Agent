@@ -1,0 +1,3 @@
+# 核心零硬依赖（llm.py 走标准库 urllib）
+# 三级路由的「向量层」可选（装了 numpy + 本地 embedding 才启用）
+numpy>=1.24
