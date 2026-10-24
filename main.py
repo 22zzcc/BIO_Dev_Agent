@@ -66,6 +66,50 @@ def cmd_run(args) -> None:
     print(f"[路由统计] 规则 {router.rule_hits} / 向量 {router.vector_hits} / LLM {router.llm_hits}（LLM 占比 {router.llm_ratio:.0%}）")
 
 
+_BIO_SYSTEM_TMPL = (
+    "你是迈威生物的生物制药助理 Agent（BIO assistant）。你通过调用工具完成用户请求。\n\n"
+    "可用工具：\n{tools}\n\n"
+    "每一轮只输出一个 JSON 对象，二选一：\n"
+    '1. 调用工具：{{"thought": "简短思考", "tool": "工具名", "args": {{"参数名": "值"}}}}\n'
+    '2. 完成任务：{{"thought": "简短思考", "final": "给用户的最终回答"}}\n\n'
+    "按用户意图选择 rag 的 action：ask=精确问答 / diagnose=多因诊断 / bio=蛋白药性推导；"
+    "用户给纠正时用 feedback 落库。"
+)
+
+
+def cmd_bio(args) -> None:
+    """BIO assistant：复用 coding agent 的 harness，工具层换成 rag + feedback。"""
+    from agent.rag_interface import RAGInterface
+    from agent.bio_tools import build_bio_registry, BioMockLLM
+    from agent.permissions import Permissions
+    from agent.tools import ToolContext, describe_tools
+    from agent.loop import Loop
+    from agent.llm import OllamaLLM
+
+    rag = RAGInterface(backend=args.rag_backend, use_llm=False)
+    registry = build_bio_registry(rag)
+    perms = Permissions(level=args.level, workspace_root=args.root)
+    ctx = ToolContext(root=Path(args.root).resolve(), permissions=perms)
+
+    llm = BioMockLLM() if args.mock else OllamaLLM()
+    system = _BIO_SYSTEM_TMPL.format(tools=describe_tools(registry))
+    loop = Loop(llm, registry, ctx, system_prompt=system, max_steps=args.max_steps)
+
+    print(f"[BIO assistant] RAG 后端={args.rag_backend}   权限档={perms.level}")
+    print("=" * 70)
+    final, traj = loop.run(args.request)
+    # 把 rag 工具返回的实际分析结果拎出来展示（这才是「分析结果」本体）
+    for s in traj.steps:
+        if s["tool"] == "rag" and s["ok"]:
+            print("分析结果：")
+            print(s["result"])
+            print()
+    print(f"最终回答：\n{final or '(未在步数内完成)'}\n")
+    print("轨迹：")
+    for i, s in enumerate(traj.steps, start=1):
+        print(f"  {i}. [{s['tool']}] {'✓' if s['ok'] else '✗'} {s['thought']}")
+
+
 def cmd_eval(args) -> None:
     from agent.trajectory import evaluate
 
@@ -123,6 +167,16 @@ def main() -> None:
     p_eval.add_argument("--mock", action="store_true")
     p_eval.add_argument("--max-steps", type=int, default=10)
     p_eval.set_defaults(func=cmd_eval)
+
+    p_bio = sub.add_parser("bio", help="BIO assistant（复用 harness，工具层=rag+feedback）")
+    p_bio.add_argument("request", help="自然语言请求")
+    p_bio.add_argument("--root", default="demo_repo")
+    p_bio.add_argument("--level", default="write", choices=["read", "write", "execute"])
+    p_bio.add_argument("--mock", action="store_true", help="离线确定性路由（无需 LLM）")
+    p_bio.add_argument("--rag-backend", default="local", choices=["local", "remote"],
+                       help="agentic RAG 组件后端：local 直连 / remote 走 FastAPI")
+    p_bio.add_argument("--max-steps", type=int, default=10)
+    p_bio.set_defaults(func=cmd_bio)
 
     args = parser.parse_args()
     args.func(args)

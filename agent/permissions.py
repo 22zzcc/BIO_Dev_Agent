@@ -29,6 +29,8 @@ TOOL_LEVEL = {
     "Write": "write", "Edit": "write",
     "Bash": "execute",
     "Task": "read",          # 子 Agent 的权限由其自身独立判定
+    # BIO assistant 工具（复用同一 harness）：rag 只读、feedback 写长期记忆
+    "rag": "read", "feedback": "write",
 }
 _LEVEL_RANK = {"read": 0, "write": 1, "execute": 2}
 

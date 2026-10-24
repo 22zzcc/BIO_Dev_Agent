@@ -1,10 +1,18 @@
-# Coding Agent MVP · Claude Code 式终端 Coding Agent 复现
+# Coding Agent MVP · 同一 harness，两种 agent
 
-> 一句话：一个**最小但完整**的终端编程 Agent，复刻 Claude Code 的核心骨架——
-> ReAct 主循环 + 7 个工具 + 上下文三级压缩 + 权限安全 + 子 Agent 路由 + 轨迹评测。
-> 全部模块「手搓」并注释到位，方便面试时逐层讲透。
+> 一句话：一个**最小但完整**的 agent harness——ReAct 主循环 + 工具层 + 上下文三级压缩
+> + 权限安全 + 子 Agent 路由 + 轨迹评测。**同一套 harness，换工具层**，既是
+> Claude Code 式 Coding Agent，又是「基于生物制药的 BIO assistant」。
 
 对应简历「Claude Code 式终端 Coding Agent 复现」项目（2026.05–2026.10）。
+
+```
+               ┌─► coding 模式：Read/Write/Edit/Glob/Grep/Bash/Task
+同一个 harness ─┤
+  (loop/context/ └─► BIO assistant 模式：rag(agentic RAG 组件) + feedback
+   permissions/
+   router/traj)         └──► agent/rag_interface.py（把 mabwell-agentic-rag 封成组件）
+```
 
 ---
 
@@ -38,6 +46,8 @@
 | `agent/permissions.py` | 三档权限 + 危险命令黑名单 + 路径越界检测 | 权限与安全约束 |
 | `agent/router.py` | 三级路由（规则→向量→LLM）+ Task 隔离子 Agent | 子 Agent 与路由 |
 | `agent/trajectory.py` | 记录 prompt/工具调用/diff；失败分三类归因 | 轨迹与评测 |
+| `agent/rag_interface.py` | 把 agentic RAG 封装成可插拔组件（local 直连 / remote FastAPI） | agentic RAG 组件化 |
+| `agent/bio_tools.py` | BIO assistant 工具层：rag(ask/diagnose/bio) + feedback | 领域 agent 工具 |
 
 ## 3. 快速开始
 
@@ -54,9 +64,18 @@ python main.py run "给项目加一个 subtract 函数" --level write
 
 # ③ 一键评测（Mock 跑一批任务，输出成功率与失败分类）
 python main.py eval --mock
+
+# ④ BIO assistant（复用 harness，工具层换成 rag + feedback，agentic RAG 作组件）
+python main.py bio "分析 9MW2821 抗体的演化表征与药性特性" --mock
+python main.py bio "抗体 SEC-HPLC 纯度偏低有哪些原因？" --mock   # 自动路由到多因诊断
+python main.py bio "9MW2821 的Ⅲ期临床主要终点是什么？" --mock     # 自动路由到精确问答
 ```
 
 权限档：`--level read|write|execute`（默认 write；Bash 工具需 `execute` 才放开）。
+
+> BIO assistant 依赖本地 `mabwell-agentic-rag` 项目（`~/Projects/mabwell-agentic-rag`，
+> 可用环境变量 `MABWELL_ROOT` 覆盖；或 `--rag-backend remote` 走其 FastAPI）。
+> 这体现了「agentic RAG 不丢，作为 bio 的一个组件，通过接口接入」。
 
 ## 4. 设计要点（面试可展开讲）
 
@@ -70,6 +89,9 @@ python main.py eval --mock
   杜绝 `../../etc/passwd` 越界。
 - **子 Agent 隔离**：Task 派生全新 ContextManager，过程都在子上下文发生，
   主上下文只看到一行结论（对应「主上下文峰值 token 降 62%」）。
+- **「同一 harness，换工具层」**：ReAct 主循环、权限、上下文、路由、轨迹这套骨架与
+  具体工具解耦。coding 模式换 Read/Write/Bash；BIO 模式换 rag/feedback——生物制药公司
+  不缺「会写代码的 agent」，缺「会做科学的 agent」，而 harness 是同一套。
 
 ## 5. 参考项目（GitHub）
 

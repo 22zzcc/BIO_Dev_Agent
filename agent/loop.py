@@ -58,12 +58,14 @@ def _parse_json(raw: str) -> dict | None:
 class Loop:
     def __init__(self, llm, registry: dict, ctx: ToolContext,
                  context_manager: ContextManager | None = None,
-                 max_steps: int = 10):
+                 max_steps: int = 10, system_prompt: str | None = None):
         self.llm = llm
         self.registry = registry
         self.ctx = ctx
         self.max_steps = max_steps
-        system = _SYSTEM_TEMPLATE.format(tools=describe_tools(registry))
+        # 同一 harness 可复用：coding agent 用默认「改代码」提示词，
+        # BIO assistant 传入自己的系统提示词（换工具层 + 换角色）。
+        system = system_prompt or _SYSTEM_TEMPLATE.format(tools=describe_tools(registry))
         self.cm = context_manager or ContextManager(system)
 
     def run(self, task: str) -> tuple[str, Trajectory]:
