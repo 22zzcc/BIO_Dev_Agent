@@ -1,104 +1,79 @@
-# Coding Agent MVP · 同一 harness，两种 agent
+# Bio Modeling Agent · 基于生物制药的建模 Agent
 
-> 一句话：一个**最小但完整**的 agent harness——ReAct 主循环 + 工具层 + 上下文三级压缩
-> + 权限安全 + 子 Agent 路由 + 轨迹评测。**同一套 harness，换工具层**，既是
-> Claude Code 式 Coding Agent，又是「基于生物制药的 BIO assistant」。
+> 一句话：一个围绕**三要素**（工作流 / 组件化 / 记忆）编排的生物制药建模 Agent。
+> 建模取代 coding——生物制药公司不缺「会写代码的 agent」，缺「会做蛋白分子建模、
+> 演化表征与药性推导的 agent」。
 
-对应简历「Claude Code 式终端 Coding Agent 复现」项目（2026.05–2026.10）。
-
-```
-               ┌─► coding 模式：Read/Write/Edit/Glob/Grep/Bash/Task
-同一个 harness ─┤
-  (loop/context/ └─► BIO assistant 模式：rag(agentic RAG 组件) + feedback
-   permissions/
-   router/traj)         └──► agent/rag_interface.py（把 mabwell-agentic-rag 封成组件）
-```
-
----
-
-## 1. 架构
+从我的 Coding Agent 项目重构而来：**同一套 harness，换工具层**，并围绕三要素重新编排。
 
 ```
-用户任务
-   │
-   ▼
-┌───────────────────────────────────────────────┐
-│  agent/loop.py   ReAct 主循环                   │
-│  解析(JSON动作) → 分发执行 → 结果回填 → 终止判定    │
-└──────┬────────────────────────────────────────┘
-       │ 工具调用（唯一文件通道）
-       ├──► agent/tools.py       Read/Write/Edit/Glob/Grep/Bash/Task（7个）
-       │        │
-       │        ├──► agent/permissions.py   三档权限+黑名单+路径越界
-       │        └──► agent/router.py        Task 子Agent + 三级路由
-       ├──► agent/context.py      token计数 + 三级压缩
-       ├──► agent/llm.py          本地 Ollama / 离线 Mock
-       └──► agent/trajectory.py   轨迹记录 + 失败分类 + 成功率评测
+请求
+ │
+ ▼
+┌─ ① 工作流 workflow ──────────────────────────────────────┐
+│   router.py  意图路由：建模 / 诊断 / 问答 / 显式序列 → 组件+动作  │
+│   loop.py    按计划编排执行各组件，记录轨迹                     │
+└───────────────┬──────────────────────────────────────────┘
+                │ 调度（统一接口 base.Component）
+┌───────────────▼──────────────────────────────────────────┐
+│ ② 组件化 components（可插拔，与工作流解耦）                     │
+│   modeling   蛋白建模：理化性质 / 演化保守性（纯计算，零 RAG 依赖）  │
+│   rag        agentic RAG：问答 / 多因诊断 / 药性推导（组件接入）   │
+│   feedback   用户反馈落库                                      │
+└───────────────┬──────────────────────────────────────────┘
+                │ 读写状态
+┌───────────────▼──────────────────────────────────────────┐
+│ ③ 记忆 memory                                              │
+│   context   短期记忆：token 计数 + 三级压缩                      │
+│   longterm  长期记忆：badcase / 反馈落库（跨会话沉淀）              │
+│   critic    评论家：打分 + badcase 收取 + 反哺偏好对             │
+└──────────────────────────────────────────────────────────┘
 ```
 
-## 2. 模块职责（对照简历）
+## 三要素
 
-| 文件 | 职责 | 简历原文 |
+| 要素 | 目录 | 职责 |
 | :--- | :--- | :--- |
-| `agent/loop.py` | ReAct 循环：解析/分发执行/结果回填/终止判定 | 主循环与 Tools 层 |
-| `agent/tools.py` | 7 个核心工具；Edit 对「未匹配/多处命中」分别报错 | 7 个核心工具，失败率 12%→2.4% |
-| `agent/context.py` | token 计数 + 三级压缩（结果截断/历史摘要/会话重建） | 上下文与状态管理 |
-| `agent/permissions.py` | 三档权限 + 危险命令黑名单 + 路径越界检测 | 权限与安全约束 |
-| `agent/router.py` | 三级路由（规则→向量→LLM）+ Task 隔离子 Agent | 子 Agent 与路由 |
-| `agent/trajectory.py` | 记录 prompt/工具调用/diff；失败分三类归因 | 轨迹与评测 |
-| `agent/rag_interface.py` | 把 agentic RAG 封装成可插拔组件（local 直连 / remote FastAPI） | agentic RAG 组件化 |
-| `agent/bio_tools.py` | BIO assistant 工具层：rag(ask/diagnose/bio) + feedback | 领域 agent 工具 |
+| **工作流** | `agent/workflow/` | 意图路由（规则优先、LLM 兜底）+ 编排执行 + 轨迹 |
+| **组件化** | `agent/components/` | 统一 `Component` 接口，建模/RAG/反馈可插拔 |
+| **记忆** | `agent/memory/` | 短期上下文 + 长期反馈 + 评论家（打分/badcase/反哺） |
 
-## 3. 快速开始
+## 快速开始
 
-核心**零硬依赖**（`llm.py` 走标准库 `urllib`），两条演示路径：
+核心零硬依赖；「建模组件」纯 Python 离线秒级，RAG 组件依赖本地 `mabwell-agentic-rag`。
 
 ```bash
 cd coding-agent-mvp
 
-# ① 离线演示（确定性 Mock，走完 ReAct 全链路，无需模型）
-python main.py run "修复 add 函数" --mock
+# 一句话请求，自动路由到「建模 / 诊断 / 问答」（--rule-only 离线，无需 LLM）
+python main.py run "分析 9MW2821 抗体的演化表征与药性特性" --rule-only
+python main.py run "抗体 SEC-HPLC 纯度偏低有哪些原因？" --rule-only
+python main.py run "9MW2821 的Ⅲ期临床主要终点是什么？" --rule-only
 
-# ② 真调本地 Ollama（qwen3:4b，需先 ollama pull qwen3:4b）
-python main.py run "给项目加一个 subtract 函数" --level write
+# 显式序列 → 建模组件（纯计算，不依赖 RAG）
+python main.py run "计算序列 EVQLVESGGGLVQPGGSLRLSCAASGFTFSSYWMH 的分子量和等电点" --rule-only
 
-# ③ 一键评测（Mock 跑一批任务，输出成功率与失败分类）
-python main.py eval --mock
-
-# ④ BIO assistant（复用 harness，工具层换成 rag + feedback，agentic RAG 作组件）
-python main.py bio "分析 9MW2821 抗体的演化表征与药性特性" --mock
-python main.py bio "抗体 SEC-HPLC 纯度偏低有哪些原因？" --mock   # 自动路由到多因诊断
-python main.py bio "9MW2821 的Ⅲ期临床主要终点是什么？" --mock     # 自动路由到精确问答
+# 记忆闭环（评论家打分 + badcase 落库 + 偏好对反哺）
+python main.py feedback --rule-only
 ```
 
-权限档：`--level read|write|execute`（默认 write；Bash 工具需 `execute` 才放开）。
+> RAG 组件后端：`--rag-backend local`（直连本地 mabwell 项目）或 `remote`（走其 FastAPI）。
+> 「agentic RAG 不丢，作为 bio 的一个组件，通过 `components/rag.py` 的接口接入」。
 
-> BIO assistant 依赖本地 `mabwell-agentic-rag` 项目（`~/Projects/mabwell-agentic-rag`，
-> 可用环境变量 `MABWELL_ROOT` 覆盖；或 `--rag-backend remote` 走其 FastAPI）。
-> 这体现了「agentic RAG 不丢，作为 bio 的一个组件，通过接口接入」。
+## 设计要点（面试可讲）
 
-## 4. 设计要点（面试可展开讲）
+- **「建模」取代「coding」**：工具从 Read/Write/Bash 换成 `modeling`(蛋白建模) + `rag`
+  (知识推导) + `feedback`(反馈)。同一套工作流/记忆骨架，换组件层即换领域。
+- **组件化 = 可扩展**：新增组件只需实现 `(ctx, **args) -> (str, bool)` 并注册，
+  工作流与路由零改动（未来可加药物警戒、临床分析等组件）。
+- **工作流 = 路由与执行解耦**：router 决定「做什么」（规则优先，LLM 兜底），
+  loop 负责「怎么做」（编排 + 轨迹），组件异常不中断。
+- **记忆 = 短期 + 长期 + 评论家**：短期管 token 预算，长期沉淀 badcase/反馈，
+  评论家像 PPO 的 critic 一样打分、但多一个 badcase 收取，形成越用越准的自我迭代。
 
-- **ReAct 循环的健壮性**：JSON 解析失败 / 工具报错不打断循环，而是把错误文本
-  回填给模型自我纠正——这是「编辑失败率 12%→2.4%」的工程来源。
-- **Edit 失败的两类根因**：`old_string` 未命中（模型与文件不同步）→ 提示先 Read；
-  命中多处（歧义）→ 要求更长上下文。失败被轨迹记录，可统计归类。
-- **三级压缩逐级触发**：先截断工具结果，不够再摘要历史，最后才重建会话——
-  避免「一上来就丢上下文」的粗暴做法。
-- **安全默认收紧**：未知工具按最高权限要求；路径 `resolve` 后强制落在工作区内，
-  杜绝 `../../etc/passwd` 越界。
-- **子 Agent 隔离**：Task 派生全新 ContextManager，过程都在子上下文发生，
-  主上下文只看到一行结论（对应「主上下文峰值 token 降 62%」）。
-- **「同一 harness，换工具层」**：ReAct 主循环、权限、上下文、路由、轨迹这套骨架与
-  具体工具解耦。coding 模式换 Read/Write/Bash；BIO 模式换 rag/feedback——生物制药公司
-  不缺「会写代码的 agent」，缺「会做科学的 agent」，而 harness 是同一套。
-
-## 5. 参考项目（GitHub）
+## 参考项目（GitHub）
 
 - opencode：https://github.com/sst/opencode
 - Aider：https://github.com/Aider-AI/aider
 - Cline：https://github.com/cline/cline
-- Goose：https://github.com/block/goose
-
-> 本项目刻意精简为「最小 MVP」：每个模块都是可读、可跑、可讲的最小实现，
-> 生产级对应物（会话快照/断点续跑/沙箱执行）已留出扩展点。
+- gpt-researcher：https://github.com/assafelovic/gpt-researcher

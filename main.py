@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-main.py —— Coding Agent CLI 入口
-=================================
+main.py —— 基于生物制药的建模 Agent 入口
+=========================================
 
-用法（在项目根目录下运行）：
+围绕三要素（工作流 / 组件化 / 记忆）装配 agent：
 
-    # 离线演示（确定性 Mock 模型，走完整 ReAct 循环）
-    python main.py run "把 math_utils.py 里的 add 函数修好" --mock
+    工作流     workflow.router（意图路由）+ workflow.loop（编排执行 + 轨迹）
+    组件化     components.modeling（蛋白建模）+ components.rag（agentic RAG）+ feedback
+    记忆       memory.context（短期）+ memory.longterm（长期）+ memory.critic（评论家）
 
-    # 真调本地 Ollama（qwen3:4b）
-    python main.py run "给项目加一个 subtract 函数" --level write
+用法（在项目根目录）：
 
-    # 一键评测（Mock 跑一批任务，输出成功率与失败分类）
-    python main.py eval --mock
+    # 一句话请求，自动路由到「建模 / 诊断 / 问答」
+    python main.py run "分析 9MW2821 抗体的演化表征与药性特性"
+    python main.py run "抗体 SEC-HPLC 纯度偏低有哪些原因？"
+    python main.py run "9MW2821 的Ⅲ期临床主要终点是什么？"
+    python main.py run "计算序列 EVQLVESGGGLVQPGGSLRLSCAAS 的分子量和等电点"   # 显式序列→建模组件
 
-参数：
-    --root   工作区根目录（默认 demo_repo）
-    --level  权限档 read/write/execute（默认 write）
-    --mock   使用 MockLLM（离线演示）
+    # 记忆闭环演示（评论家打分 + badcase 落库 + 偏好对反哺）
+    python main.py feedback
 """
 from __future__ import annotations
 
@@ -30,153 +31,89 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 def build_agent(args):
-    from agent.llm import make_llm
-    from agent.permissions import Permissions
-    from agent.tools import ToolContext, build_registry
-    from agent.loop import Loop
-    from agent.router import Router
+    from agent.llm import OllamaLLM
+    from agent.components.base import Registry
+    from agent.components.modeling import build_modeling_component
+    from agent.components.rag import (RAGInterface, build_rag_component,
+                                      build_feedback_component)
+    from agent.workflow.router import Router
+    from agent.workflow.loop import Workflow
+    from agent.memory.longterm import LongTermMemory
+    from agent.memory.critic import Critic
 
-    root = Path(args.root).resolve()
-    perms = Permissions(level=args.level, workspace_root=root)
-    registry = build_registry()
-    llm = make_llm(args.mock)
+    # 组件层：建模 + RAG + 反馈 三个可插拔组件
+    rag = RAGInterface(backend=args.rag_backend, use_llm=False)
+    registry = Registry()
+    registry.register(build_modeling_component())
+    registry.register(build_rag_component(rag))
+    registry.register(build_feedback_component(rag))
 
-    ctx = ToolContext(root=root, permissions=perms)
-    router = Router(llm, registry, ctx)
-    ctx.router = router                       # 让 Task 工具能派生子 Agent
+    # 工作流层：路由 + 编排
+    llm = None if args.rule_only else OllamaLLM()   # LLM 只作兜底，规则路由离线可跑
+    router = Router(llm=llm)
+    workflow = Workflow(registry, router)
 
-    loop = Loop(llm, registry, ctx, max_steps=args.max_steps)
-    return loop, perms, router
+    # 记忆层：长期 + 评论家
+    memory = LongTermMemory()
+    critic = Critic(memory, llm=llm)
+    return workflow, critic, rag
 
 
 def cmd_run(args) -> None:
-    loop, perms, router = build_agent(args)
-    print(f"[工作区] {Path(args.root).resolve()}    [权限档] {perms.level}")
+    workflow, critic, rag = build_agent(args)
+    final, traj = workflow.run(args.request)
+
     print("=" * 70)
-    final, traj = loop.run(args.task)
-
-    print(f"最终回答：\n{final or '(未在步数内完成)'}\n")
-    print("轨迹：")
+    print(f"请求：{args.request}")
+    print("-" * 70)
+    print("分析结果：")
+    print(final)
+    print("-" * 70)
+    print("轨迹（工作流 → 组件）：")
     for i, s in enumerate(traj.steps, start=1):
-        print(f"  {i}. [{s['tool']}] {'✓' if s['ok'] else '✗'} {s['thought'] or s['result'][:60]}")
-    if traj.diffs:
-        print("变更(diff)：")
-        for d in traj.diffs:
-            print(f"  {d['path']}: {d['old'][:40]!r} -> {d['new'][:40]!r}")
-    print(f"[路由统计] 规则 {router.rule_hits} / 向量 {router.vector_hits} / LLM {router.llm_hits}（LLM 占比 {router.llm_ratio:.0%}）")
+        print(f"  {i}. [{s['component']}:{s['action']}] "
+              f"{'✓' if s['ok'] else '✗'}  {s['thought']}")
 
 
-_BIO_SYSTEM_TMPL = (
-    "你是迈威生物的生物制药助理 Agent（BIO assistant）。你通过调用工具完成用户请求。\n\n"
-    "可用工具：\n{tools}\n\n"
-    "每一轮只输出一个 JSON 对象，二选一：\n"
-    '1. 调用工具：{{"thought": "简短思考", "tool": "工具名", "args": {{"参数名": "值"}}}}\n'
-    '2. 完成任务：{{"thought": "简短思考", "final": "给用户的最终回答"}}\n\n'
-    "按用户意图选择 rag 的 action：ask=精确问答 / diagnose=多因诊断 / bio=蛋白药性推导；"
-    "用户给纠正时用 feedback 落库。"
-)
+def cmd_feedback(args) -> None:
+    """记忆闭环演示：评论家打分 → badcase 落库 → 偏好对反哺。"""
+    workflow, critic, rag = build_agent(args)
 
-
-def cmd_bio(args) -> None:
-    """BIO assistant：复用 coding agent 的 harness，工具层换成 rag + feedback。"""
-    from agent.rag_interface import RAGInterface
-    from agent.bio_tools import build_bio_registry, BioMockLLM
-    from agent.permissions import Permissions
-    from agent.tools import ToolContext, describe_tools
-    from agent.loop import Loop
-    from agent.llm import OllamaLLM
-
-    rag = RAGInterface(backend=args.rag_backend, use_llm=False)
-    registry = build_bio_registry(rag)
-    perms = Permissions(level=args.level, workspace_root=args.root)
-    ctx = ToolContext(root=Path(args.root).resolve(), permissions=perms)
-
-    llm = BioMockLLM() if args.mock else OllamaLLM()
-    system = _BIO_SYSTEM_TMPL.format(tools=describe_tools(registry))
-    loop = Loop(llm, registry, ctx, system_prompt=system, max_steps=args.max_steps)
-
-    print(f"[BIO assistant] RAG 后端={args.rag_backend}   权限档={perms.level}")
     print("=" * 70)
-    final, traj = loop.run(args.request)
-    # 把 rag 工具返回的实际分析结果拎出来展示（这才是「分析结果」本体）
-    for s in traj.steps:
-        if s["tool"] == "rag" and s["ok"]:
-            print("分析结果：")
-            print(s["result"])
-            print()
-    print(f"最终回答：\n{final or '(未在步数内完成)'}\n")
-    print("轨迹：")
-    for i, s in enumerate(traj.steps, start=1):
-        print(f"  {i}. [{s['tool']}] {'✓' if s['ok'] else '✗'} {s['thought']}")
+    print("① 评论家打分：一个「零召回」坏例")
+    q = "9MW2821 抗体的结合亲和力是多少？"
+    verdict = critic.judge(q, "资料中未提及", citations=[], hit_count=0)
+    print(f"   得分 {verdict['score']}，issues={verdict['issues']}")
 
+    print("② badcase 落库长期记忆")
+    critic.collect(q, "资料中未提及", citations=[], hit_count=0)
+    print(f"   记忆 {critic.memory.stats()}")
 
-def cmd_eval(args) -> None:
-    from agent.trajectory import evaluate
-
-    tasks = [
-        "修复 add 函数的错误",
-        "新增一个 subtract 函数",
-        "给现有代码补一个测试",
-    ]
-
-    def reset_workspace():
-        """每个任务前把工作区恢复到「带 bug」的初始态，保证任务互不影响。"""
-        src = Path(args.root) / "src" / "math_utils.py"
-        src.parent.mkdir(parents=True, exist_ok=True)
-        src.write_text(
-            "# 数学工具函数\n\n\n"
-            "def add(a, b):\n"
-            "    \"\"\"两数相加（注意：这里故意埋了一个 bug）。\"\"\"\n"
-            "    return a - b\n\n\n"
-            "def multiply(a, b):\n"
-            "    \"\"\"两数相乘。\"\"\"\n"
-            "    return a * b\n",
-            encoding="utf-8")
-        # 清理可能残留的测试文件
-        t = Path(args.root) / "tests" / "test_math_utils.py"
-        if t.exists():
-            t.unlink()
-
-    def run_one(task):
-        reset_workspace()
-        loop, perms, router = build_agent(args)
-        final, traj = loop.run(task)
-        return traj, (loop.cm.rebuild_count > 0)
-
-    result = evaluate(tasks, run_one)
-    print(f"成功率：{result.success}/{result.total} = {result.success_rate:.1%}")
-    for f in result.failures:
-        print(f"  失败：{f['task']}  → 归类「{f['type']}」")
+    print("③ 用户纠正 → 偏好对（喂 PPO/DPO）")
+    critic.collect_feedback("9MW2821 靶向什么靶点？", "靶向 HER2", "靶向 Nectin-4（更准确）")
+    fb = critic.feedback()
+    print(f"   偏好对 {len(fb['preference_pairs'])} 条：")
+    for p in fb["preference_pairs"]:
+        print(f"     prompt  : {p['prompt']}")
+        print(f"     rejected: {p['rejected']}")
+        print(f"     chosen  : {p['chosen']}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Claude Code 式 Coding Agent MVP")
+    parser = argparse.ArgumentParser(description="基于生物制药的建模 Agent（工作流/组件化/记忆）")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_run = sub.add_parser("run", help="执行一个改码任务")
-    p_run.add_argument("task", help="任务描述")
-    p_run.add_argument("--root", default="demo_repo", help="工作区根目录")
-    p_run.add_argument("--level", default="write", choices=["read", "write", "execute"])
-    p_run.add_argument("--mock", action="store_true", help="使用 MockLLM 离线演示")
-    p_run.add_argument("--max-steps", type=int, default=10)
+    p_run = sub.add_parser("run", help="一句话请求（自动路由到建模/诊断/问答）")
+    p_run.add_argument("request", help="自然语言请求")
+    p_run.add_argument("--rag-backend", default="local", choices=["local", "remote"])
+    p_run.add_argument("--rule-only", action="store_true",
+                       help="只用规则路由，不加载 LLM（离线）")
     p_run.set_defaults(func=cmd_run)
 
-    p_eval = sub.add_parser("eval", help="跑一批任务评测成功率")
-    p_eval.add_argument("--root", default="demo_repo")
-    p_eval.add_argument("--level", default="write", choices=["read", "write", "execute"])
-    p_eval.add_argument("--mock", action="store_true")
-    p_eval.add_argument("--max-steps", type=int, default=10)
-    p_eval.set_defaults(func=cmd_eval)
-
-    p_bio = sub.add_parser("bio", help="BIO assistant（复用 harness，工具层=rag+feedback）")
-    p_bio.add_argument("request", help="自然语言请求")
-    p_bio.add_argument("--root", default="demo_repo")
-    p_bio.add_argument("--level", default="write", choices=["read", "write", "execute"])
-    p_bio.add_argument("--mock", action="store_true", help="离线确定性路由（无需 LLM）")
-    p_bio.add_argument("--rag-backend", default="local", choices=["local", "remote"],
-                       help="agentic RAG 组件后端：local 直连 / remote 走 FastAPI")
-    p_bio.add_argument("--max-steps", type=int, default=10)
-    p_bio.set_defaults(func=cmd_bio)
+    p_fb = sub.add_parser("feedback", help="记忆闭环演示")
+    p_fb.add_argument("--rag-backend", default="local", choices=["local", "remote"])
+    p_fb.add_argument("--rule-only", action="store_true")
+    p_fb.set_defaults(func=cmd_feedback)
 
     args = parser.parse_args()
     args.func(args)
