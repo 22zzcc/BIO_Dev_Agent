@@ -68,7 +68,7 @@ class RAGInterface:
         if self.backend == "remote":
             return self._remote("/diagnose", {"question": question})
         r = self._local("diagnoser").diagnose(question)
-        return {"answer": r.answer, "recall_count": r.recall_count, "citations": r.citations}
+        return {"answer": r.answer, "hit_count": r.hit_count, "citations": r.citations}
 
     def bio(self, request: str) -> dict:
         if self.backend == "remote":
@@ -108,7 +108,7 @@ def build_rag_component(rag: RAGInterface) -> Component:
                 body = r.get("answer", "")
             elif action == "diagnose":
                 r = rag.diagnose(query)
-                body = f"（已扩召回 {r.get('recall_count', 0)} 条候选）\n" + r.get("answer", "")
+                body = f"（问题重写 + 精准检索命中 {r.get('hit_count', 0)} 条）\n" + r.get("answer", "")
             elif action == "bio":
                 r = rag.bio(query)
                 body = r.get("answer", "")
